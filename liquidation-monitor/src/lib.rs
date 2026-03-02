@@ -103,6 +103,9 @@ impl LiquidationMonitor {
         protocol_type: u64,
     ) -> Result<U256, Vec<u8>> {
         self.only_owner()?;
+        if pool_address == Address::ZERO {
+            return Err(b"zero address".to_vec());
+        }
         let index = self.lending_count.get();
         self.lending_pools.setter(index).set(pool_address);
         self.lending_types.setter(index).set(U256::from(protocol_type));
@@ -153,6 +156,9 @@ impl LiquidationMonitor {
         protocol_type: u64,
     ) -> Result<U256, Vec<u8>> {
         self.only_owner()?;
+        if reader_address == Address::ZERO {
+            return Err(b"zero address".to_vec());
+        }
         let index = self.perp_count.get();
         self.perp_readers.setter(index).set(reader_address);
         self.perp_types.setter(index).set(U256::from(protocol_type));
@@ -268,6 +274,9 @@ impl LiquidationMonitor {
 
     pub fn add_account(&mut self, account: Address) -> Result<(), Vec<u8>> {
         self.only_owner()?;
+        if self.tracked_accounts.len() >= 500 {
+            return Err(b"max tracked accounts reached".to_vec());
+        }
         self.tracked_accounts.push(account);
         self.vm().log(AccountAdded { account });
         Ok(())
@@ -725,6 +734,39 @@ mod tests {
             .collect();
         assert_eq!(add_logs.len(), 1);
         assert_eq!(add_logs[0].0[1], B256::from(U256::ZERO.to_be_bytes::<32>()));
+    }
+
+    #[test]
+    fn add_lending_protocol_zero_address_rejected() {
+        let (vm, mut contract) = setup();
+        vm.set_sender(OWNER);
+        let err = contract.add_lending_protocol(Address::ZERO, 0).unwrap_err();
+        assert_eq!(err, b"zero address".to_vec());
+    }
+
+    #[test]
+    fn add_perp_protocol_zero_address_rejected() {
+        let (vm, mut contract) = setup();
+        vm.set_sender(OWNER);
+        let err = contract.add_perp_protocol(Address::ZERO, 0).unwrap_err();
+        assert_eq!(err, b"zero address".to_vec());
+    }
+
+    #[test]
+    fn add_account_max_cap_enforced() {
+        let (vm, mut contract) = setup();
+        vm.set_sender(OWNER);
+        for i in 0u64..500 {
+            let addr_bytes: [u8; 20] = {
+                let mut b = [0u8; 20];
+                b[18] = (i >> 8) as u8;
+                b[19] = i as u8;
+                b
+            };
+            contract.add_account(Address::from(addr_bytes)).unwrap();
+        }
+        let err = contract.add_account(address!("0000000000000000000000000000000000ffffff")).unwrap_err();
+        assert_eq!(err, b"max tracked accounts reached".to_vec());
     }
 
     #[test]

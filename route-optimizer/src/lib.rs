@@ -23,6 +23,7 @@ use stylus_sdk::{
 
 const DEX_TYPE_UNIV3: u64 = 0;
 const DEX_TYPE_AMM_V2: u64 = 1;
+const MAX_DEXES: u64 = 20;
 
 // ─── DEX interfaces ─────────────────────────────────────────────────────────
 
@@ -100,7 +101,13 @@ impl RouteOptimizer {
         dex_type: u64,
     ) -> Result<U256, Vec<u8>> {
         self.only_owner()?;
+        if dex_address == Address::ZERO {
+            return Err(b"zero address".to_vec());
+        }
         let index = self.dex_count.get();
+        if index >= U256::from(MAX_DEXES) {
+            return Err(b"max dexes reached".to_vec());
+        }
         self.dex_addresses.setter(index).set(dex_address);
         self.dex_types.setter(index).set(U256::from(dex_type));
         self.dex_active.setter(index).set(true);
@@ -146,6 +153,12 @@ impl RouteOptimizer {
 
     pub fn add_routing_token(&mut self, token: Address) -> Result<(), Vec<u8>> {
         self.only_owner()?;
+        if token == Address::ZERO {
+            return Err(b"zero address".to_vec());
+        }
+        if self.routing_tokens.len() >= 50 {
+            return Err(b"max routing tokens reached".to_vec());
+        }
         for i in 0..self.routing_tokens.len() {
             if self.routing_tokens.get(i).unwrap() == token {
                 return Err(b"token already exists".to_vec());
@@ -1288,5 +1301,25 @@ mod tests {
             contract.compare_routes(ARB, DAI, U256::from(1000u64)).unwrap();
         assert_eq!(dex_index, U256::ZERO);
         assert_eq!(best_amount, U256::ZERO);
+    }
+
+    #[test]
+    fn add_dex_max_cap_enforced() {
+        let vm = TestVM::new();
+        vm.set_sender(OWNER);
+        let mut contract = RouteOptimizer::from(&vm);
+        contract.initialize().unwrap();
+
+        for i in 0..MAX_DEXES {
+            let addr_bytes = format!("000000000000000000000000000000000000{:04x}", i + 0x10);
+            let addr: Address = addr_bytes.parse().unwrap();
+            contract.add_dex(addr, DEX_TYPE_UNIV3).unwrap();
+        }
+
+        assert_eq!(contract.dex_count(), U256::from(MAX_DEXES));
+
+        let overflow_addr: Address = "0000000000000000000000000000000000009999".parse().unwrap();
+        let err = contract.add_dex(overflow_addr, DEX_TYPE_UNIV3).unwrap_err();
+        assert_eq!(err, b"max dexes reached".to_vec());
     }
 }

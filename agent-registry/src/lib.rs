@@ -53,7 +53,10 @@ sol_storage! {
 
 #[public]
 impl AgentRegistry {
-    pub fn register(&mut self, capabilities: u64, revenue_share_bps: u16) -> U256 {
+    pub fn register(&mut self, capabilities: u64, revenue_share_bps: u16) -> Result<U256, Vec<u8>> {
+        if revenue_share_bps > 10_000 {
+            return Err(b"revenue_share_bps exceeds 10000".to_vec());
+        }
         let caller = self.vm().msg_sender();
         let id = self.next_id.get();
 
@@ -71,7 +74,7 @@ impl AgentRegistry {
             capabilities,
         });
 
-        id
+        Ok(id)
     }
 
     pub fn update(
@@ -79,11 +82,14 @@ impl AgentRegistry {
         agent_id: U256,
         capabilities: u64,
         revenue_share_bps: u16,
-    ) -> bool {
+    ) -> Result<bool, Vec<u8>> {
+        if revenue_share_bps > 10_000 {
+            return Err(b"revenue_share_bps exceeds 10000".to_vec());
+        }
         let caller = self.vm().msg_sender();
         let owner = self.owners.get(agent_id);
         if owner != caller {
-            return false;
+            return Ok(false);
         }
 
         self.capabilities.setter(agent_id).set(U256::from(capabilities));
@@ -95,7 +101,7 @@ impl AgentRegistry {
             revenueShareBps: revenue_share_bps,
         });
 
-        true
+        Ok(true)
     }
 
     pub fn deactivate(&mut self, agent_id: U256) -> bool {
@@ -182,7 +188,7 @@ mod tests {
         vm.set_sender(ALICE);
 
         let caps = CAP_TRADE | CAP_PERPS | CAP_LEND;
-        let id = registry.register(caps, 500);
+        let id = registry.register(caps, 500).unwrap();
 
         assert_eq!(id, U256::ZERO);
         assert_eq!(registry.total_agents(), U256::from(1));
@@ -201,7 +207,7 @@ mod tests {
         vm.set_sender(ALICE);
 
         let caps = CAP_TRADE | CAP_TIMEBOOST;
-        let id = registry.register(caps, 0);
+        let id = registry.register(caps, 0).unwrap();
 
         assert!(registry.has_capability(id, CAP_TRADE));
         assert!(registry.has_capability(id, CAP_TIMEBOOST));
@@ -214,8 +220,8 @@ mod tests {
         let (vm, mut registry) = setup();
         vm.set_sender(ALICE);
 
-        let id = registry.register(CAP_TRADE, 500);
-        let ok = registry.update(id, CAP_TRADE | CAP_PERPS | CAP_RWA, 750);
+        let id = registry.register(CAP_TRADE, 500).unwrap();
+        let ok = registry.update(id, CAP_TRADE | CAP_PERPS | CAP_RWA, 750).unwrap();
         assert!(ok);
 
         let (_, caps, rev, _, _) = registry.get_agent(id);
@@ -227,10 +233,10 @@ mod tests {
     fn test_update_by_non_owner_fails() {
         let (vm, mut registry) = setup();
         vm.set_sender(ALICE);
-        let id = registry.register(CAP_TRADE, 500);
+        let id = registry.register(CAP_TRADE, 500).unwrap();
 
         vm.set_sender(BOB);
-        let ok = registry.update(id, CAP_PERPS, 0);
+        let ok = registry.update(id, CAP_PERPS, 0).unwrap();
         assert!(!ok);
     }
 
@@ -239,7 +245,7 @@ mod tests {
         let (vm, mut registry) = setup();
         vm.set_sender(ALICE);
 
-        let id = registry.register(CAP_TRADE, 0);
+        let id = registry.register(CAP_TRADE, 0).unwrap();
         assert!(registry.deactivate(id));
 
         let (_, _, _, _, active) = registry.get_agent(id);
@@ -254,7 +260,7 @@ mod tests {
         assert!(registry.set_governance(GOV));
 
         vm.set_sender(ALICE);
-        let id = registry.register(CAP_TRADE, 0);
+        let id = registry.register(CAP_TRADE, 0).unwrap();
 
         // Non-governance can't update reputation
         vm.set_sender(ALICE);
@@ -269,14 +275,40 @@ mod tests {
     }
 
     #[test]
+    fn test_register_revenue_share_too_high() {
+        let (vm, mut registry) = setup();
+        vm.set_sender(ALICE);
+        let err = registry.register(CAP_TRADE, 10_001).unwrap_err();
+        assert_eq!(err, b"revenue_share_bps exceeds 10000".to_vec());
+    }
+
+    #[test]
+    fn test_register_revenue_share_at_max() {
+        let (vm, mut registry) = setup();
+        vm.set_sender(ALICE);
+        let id = registry.register(CAP_TRADE, 10_000).unwrap();
+        let (_, _, rev, _, _) = registry.get_agent(id);
+        assert_eq!(rev, U256::from(10_000));
+    }
+
+    #[test]
+    fn test_update_revenue_share_too_high() {
+        let (vm, mut registry) = setup();
+        vm.set_sender(ALICE);
+        let id = registry.register(CAP_TRADE, 500).unwrap();
+        let err = registry.update(id, CAP_TRADE, 10_001).unwrap_err();
+        assert_eq!(err, b"revenue_share_bps exceeds 10000".to_vec());
+    }
+
+    #[test]
     fn test_multiple_agents() {
         let (vm, mut registry) = setup();
 
         vm.set_sender(ALICE);
-        let id0 = registry.register(CAP_TRADE | CAP_LEND, 500);
+        let id0 = registry.register(CAP_TRADE | CAP_LEND, 500).unwrap();
 
         vm.set_sender(BOB);
-        let id1 = registry.register(CAP_PERPS | CAP_TIMEBOOST, 1000);
+        let id1 = registry.register(CAP_PERPS | CAP_TIMEBOOST, 1000).unwrap();
 
         assert_eq!(id0, U256::ZERO);
         assert_eq!(id1, U256::from(1));
