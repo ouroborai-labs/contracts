@@ -1,0 +1,23 @@
+# Rust build
+target/
+**/*.rs.bk
+
+# Secrets — NEVER commit
+.env
+.env.local
+.env.*.local
+.env.keys
+*.env.keys
+
+# Claude Code
+.claude/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Logs
+*.log

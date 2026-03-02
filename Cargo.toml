@@ -1,0 +1,14 @@
+[workspace]
+resolver = "2"
+members = [
+    "liquidation-monitor",
+    "route-optimizer",
+    "timeboost-vault",
+    "agent-registry",
+]
+
+[workspace.dependencies]
+stylus-sdk = "0.10.0"
+alloy-primitives = { version = "1.0", default-features = false }
+alloy-sol-types = { version = "1.0", default-features = false }
+stylus-test = "0.10.0"

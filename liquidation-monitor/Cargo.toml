@@ -1,0 +1,19 @@
+[package]
+name = "liquidation-monitor"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+
+[dependencies]
+stylus-sdk = { workspace = true }
+alloy-primitives = { workspace = true }
+alloy-sol-types = { workspace = true }
+
+[dev-dependencies]
+stylus-test = { workspace = true }
+
+[features]
+export-abi = ["stylus-sdk/export-abi"]
+stylus-test = ["stylus-sdk/stylus-test"]
