@@ -11,4 +11,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - run: cargo test --features stylus-test
+        with:
+          components: clippy
+      - name: Clippy
+        run: cargo clippy --features stylus-test -- -D warnings
+      - name: Tests
+        run: cargo test --features stylus-test

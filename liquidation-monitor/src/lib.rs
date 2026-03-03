@@ -9,6 +9,7 @@
 
 #![cfg_attr(not(any(feature = "export-abi", test)), no_main)]
 #![cfg_attr(not(any(feature = "export-abi", test)), no_std)]
+#![allow(unexpected_cfgs)]
 
 extern crate alloc;
 
@@ -25,7 +26,7 @@ use stylus_sdk::{
 const LENDING_TYPE_AAVE_V3: u64 = 0;
 // const LENDING_TYPE_COMPOUND_V3: u64 = 1;  // future
 
-// const PERP_TYPE_GMX_V2: u64 = 0;  // future
+const PERP_TYPE_GMX_V2: u64 = 0;
 
 // ─── Protocol interfaces ────────────────────────────────────────────────────
 
@@ -41,6 +42,10 @@ sol_interface! {
                 uint256 healthFactor
             );
     }
+
+    interface IPerpReader {
+        function getAccountHealth(address account) external view returns (uint256 healthFactor);
+    }
 }
 
 // ─── Contract storage ───────────────────────────────────────────────────────
@@ -49,6 +54,8 @@ sol_storage! {
     #[entrypoint]
     pub struct LiquidationMonitor {
         address owner;
+        address pending_owner;
+        bool paused;
         address[] tracked_accounts;
         uint256 risk_threshold;
 
@@ -58,7 +65,7 @@ sol_storage! {
         mapping(uint256 => uint256) lending_types;
         mapping(uint256 => bool) lending_active;
 
-        // Perp protocol registry (future-ready)
+        // Perp protocol registry
         uint256 perp_count;
         mapping(uint256 => address) perp_readers;
         mapping(uint256 => uint256) perp_types;
@@ -77,6 +84,28 @@ sol! {
     event LendingProtocolRemoved(uint256 indexed index, address poolAddress);
     event PerpProtocolAdded(uint256 indexed index, address readerAddress, uint64 protocolType);
     event PerpProtocolRemoved(uint256 indexed index, address readerAddress);
+    event OwnershipTransferStarted(address indexed currentOwner, address indexed pendingOwner);
+    event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
+    event Paused(address indexed by);
+    event Unpaused(address indexed by);
+}
+
+// ─── Private helpers (LM-7: must be in separate impl block) ─────────────────
+
+impl LiquidationMonitor {
+    fn only_owner(&self) -> Result<(), Vec<u8>> {
+        if self.vm().msg_sender() != self.owner.get() {
+            return Err(b"not owner".to_vec());
+        }
+        Ok(())
+    }
+
+    fn when_not_paused(&self) -> Result<(), Vec<u8>> {
+        if self.paused.get() {
+            return Err(b"contract is paused".to_vec());
+        }
+        Ok(())
+    }
 }
 
 // ─── Implementation ─────────────────────────────────────────────────────────
@@ -93,6 +122,67 @@ impl LiquidationMonitor {
         self.owner.set(self.vm().msg_sender());
         self.risk_threshold.set(risk_threshold);
         Ok(())
+    }
+
+    // ─── Two-step ownership transfer (LM-4 / CC-1) ─────────────────────
+
+    pub fn transfer_ownership(&mut self, new_owner: Address) -> Result<(), Vec<u8>> {
+        self.only_owner()?;
+        if new_owner == Address::ZERO {
+            return Err(b"zero address".to_vec());
+        }
+        self.pending_owner.set(new_owner);
+        let current = self.owner.get();
+        self.vm().log(OwnershipTransferStarted {
+            currentOwner: current,
+            pendingOwner: new_owner,
+        });
+        Ok(())
+    }
+
+    pub fn accept_ownership(&mut self) -> Result<(), Vec<u8>> {
+        let pending = self.pending_owner.get();
+        if self.vm().msg_sender() != pending {
+            return Err(b"not pending owner".to_vec());
+        }
+        let previous = self.owner.get();
+        self.owner.set(pending);
+        self.pending_owner.set(Address::ZERO);
+        self.vm().log(OwnershipTransferred {
+            previousOwner: previous,
+            newOwner: pending,
+        });
+        Ok(())
+    }
+
+    // ─── Pausable (CC-2) ────────────────────────────────────────────────
+
+    pub fn pause(&mut self) -> Result<(), Vec<u8>> {
+        self.only_owner()?;
+        if self.paused.get() {
+            return Err(b"already paused".to_vec());
+        }
+        self.paused.set(true);
+        self.vm().log(Paused {
+            by: self.vm().msg_sender(),
+        });
+        Ok(())
+    }
+
+    pub fn unpause(&mut self) -> Result<(), Vec<u8>> {
+        self.only_owner()?;
+        if !self.paused.get() {
+            return Err(b"not paused".to_vec());
+        }
+        self.paused.set(false);
+        self.vm().log(Unpaused {
+            by: self.vm().msg_sender(),
+        });
+        Ok(())
+    }
+
+    pub fn is_paused(&self) -> bool {
+        self.paused.get()
     }
 
     // ─── Lending protocol registry ──────────────────────────────────────
@@ -148,7 +238,7 @@ impl LiquidationMonitor {
         )
     }
 
-    // ─── Perp protocol registry (future-ready) ─────────────────────────
+    // ─── Perp protocol registry ─────────────────────────────────────────
 
     pub fn add_perp_protocol(
         &mut self,
@@ -196,11 +286,13 @@ impl LiquidationMonitor {
     // ─── Health factor queries ──────────────────────────────────────────
 
     pub fn get_health_factor(&self, account: Address) -> Result<U256, Vec<u8>> {
-        let count = self.lending_count.get();
         let mut lowest_hf = U256::MAX;
         let mut found_any = false;
 
-        for idx in 0..count.as_limbs()[0] {
+        // Lending protocols
+        // Safe: lending_count bounded by practical limits (u64 max >> realistic protocol count)
+        let lending_count = self.lending_count.get();
+        for idx in 0..lending_count.as_limbs()[0] {
             let index = U256::from(idx);
             if !self.lending_active.get(index) {
                 continue;
@@ -225,31 +317,69 @@ impl LiquidationMonitor {
             }
         }
 
+        // Perp protocols
+        // Safe: perp_count bounded by practical limits (u64 max >> realistic protocol count)
+        let perp_count = self.perp_count.get();
+        for idx in 0..perp_count.as_limbs()[0] {
+            let index = U256::from(idx);
+            if !self.perp_active.get(index) {
+                continue;
+            }
+
+            let reader_addr = self.perp_readers.get(index);
+            let perp_type = self.perp_types.get(index).as_limbs()[0];
+
+            match perp_type {
+                PERP_TYPE_GMX_V2 => {
+                    let reader = IPerpReader::new(reader_addr);
+                    if let Ok(hf) = reader.get_account_health(self.vm(), Call::new(), account) {
+                        found_any = true;
+                        if hf < lowest_hf {
+                            lowest_hf = hf;
+                        }
+                    }
+                }
+                _ => continue,
+            }
+        }
+
         if !found_any {
-            return Err(b"no lending protocols registered".to_vec());
+            return Err(b"no protocols registered".to_vec());
         }
         Ok(lowest_hf)
     }
 
+    /// LM-2: Returns (at_risk, failed) — failed accounts are those whose
+    /// health factor query errored out instead of being silently dropped.
+    #[allow(clippy::type_complexity)]
     pub fn scan_accounts(
         &self,
         accounts: Vec<Address>,
-    ) -> Result<Vec<(Address, U256)>, Vec<u8>> {
+    ) -> Result<(Vec<(Address, U256)>, Vec<Address>), Vec<u8>> {
+        self.when_not_paused()?;
         let mut at_risk = Vec::new();
+        let mut failed = Vec::new();
         let threshold = self.risk_threshold.get();
 
         for account in &accounts {
-            if let Ok(hf) = self.get_health_factor(*account) {
-                if hf < threshold {
-                    at_risk.push((*account, hf));
+            match self.get_health_factor(*account) {
+                Ok(hf) => {
+                    if hf < threshold {
+                        at_risk.push((*account, hf));
+                    }
+                }
+                Err(_) => {
+                    failed.push(*account);
                 }
             }
         }
 
-        Ok(at_risk)
+        Ok((at_risk, failed))
     }
 
-    pub fn scan_tracked_accounts(&self) -> Result<Vec<(Address, U256)>, Vec<u8>> {
+    #[allow(clippy::type_complexity)]
+    pub fn scan_tracked_accounts(&self) -> Result<(Vec<(Address, U256)>, Vec<Address>), Vec<u8>> {
+        self.when_not_paused()?;
         let count = self.tracked_accounts.len();
         let mut accounts = Vec::with_capacity(count);
 
@@ -257,7 +387,7 @@ impl LiquidationMonitor {
             accounts.push(self.tracked_accounts.get(i).unwrap());
         }
 
-        let at_risk = self.scan_accounts(accounts)?;
+        let (at_risk, failed) = self.scan_accounts(accounts)?;
 
         for (account, hf) in &at_risk {
             self.vm().log(AccountAtRisk {
@@ -267,13 +397,14 @@ impl LiquidationMonitor {
             });
         }
 
-        Ok(at_risk)
+        Ok((at_risk, failed))
     }
 
     // ─── Account management ─────────────────────────────────────────────
 
     pub fn add_account(&mut self, account: Address) -> Result<(), Vec<u8>> {
         self.only_owner()?;
+        self.when_not_paused()?;
         if self.tracked_accounts.len() >= 500 {
             return Err(b"max tracked accounts reached".to_vec());
         }
@@ -317,13 +448,6 @@ impl LiquidationMonitor {
     pub fn threshold(&self) -> U256 {
         self.risk_threshold.get()
     }
-
-    fn only_owner(&self) -> Result<(), Vec<u8>> {
-        if self.vm().msg_sender() != self.owner.get() {
-            return Err(b"not owner".to_vec());
-        }
-        Ok(())
-    }
 }
 
 #[cfg(test)]
@@ -342,13 +466,19 @@ mod tests {
             uint256 ltv,
             uint256 healthFactor
         );
+
+        function getAccountHealth(address account) external view returns (
+            uint256 healthFactor
+        );
     }
 
     const OWNER: Address = address!("0000000000000000000000000000000000000001");
     const POOL: Address = address!("794a61358D6845594F94dc1DB02A252b5b4814aD");
     const POOL_2: Address = address!("0000000000000000000000000000000000000abc");
+    const POOL_FAIL: Address = address!("0000000000000000000000000000000000000bbb");
     const STRANGER: Address = address!("0000000000000000000000000000000000000bad");
     const GMX_READER: Address = address!("0000000000000000000000000000000000000def");
+    const NEW_OWNER: Address = address!("0000000000000000000000000000000000000002");
 
     fn default_threshold() -> U256 {
         U256::from(1_100_000_000_000_000_000u128)
@@ -410,6 +540,63 @@ mod tests {
         vm.mock_static_call(pool, calldata, Ok(return_data));
     }
 
+    fn mock_pool_error(vm: &TestVM, pool: Address, account: Address) {
+        let calldata = getUserAccountDataCall { user: account }.abi_encode();
+        vm.mock_static_call(pool, calldata, Err(b"call failed".to_vec()));
+    }
+
+    fn mock_perp_health_factor(vm: &TestVM, reader: Address, account: Address, health_factor: U256) {
+        let calldata = getAccountHealthCall { account }.abi_encode();
+        type PerpReturn = (sol_data::Uint<256>,);
+        let return_data = <PerpReturn as SolType>::abi_encode_params(&(health_factor,));
+        vm.mock_static_call(reader, calldata, Ok(return_data));
+    }
+
+    /// Registers both lending and perp mocks in the correct order for
+    /// stylus-test's return_data behavior. The lending mock is registered
+    /// LAST because it's called first and its 192-byte return data must be
+    /// in state.return_data. The perp call uses `if let Ok` so it gracefully
+    /// handles the larger return data (first 32 bytes = totalCollateralBase).
+    ///
+    /// To control what the perp "sees", we set totalCollateralBase to the
+    /// desired perp health factor value.
+    fn mock_lending_and_perp(
+        vm: &TestVM,
+        pool: Address,
+        reader: Address,
+        account: Address,
+        lending_hf: U256,
+        perp_hf: U256,
+    ) {
+        // Register perp mock FIRST (it will be overwritten in state.return_data)
+        let perp_calldata = getAccountHealthCall { account }.abi_encode();
+        type PerpReturn = (sol_data::Uint<256>,);
+        let perp_return_data = <PerpReturn as SolType>::abi_encode_params(&(perp_hf,));
+        vm.mock_static_call(reader, perp_calldata, Ok(perp_return_data));
+
+        // Register lending mock LAST — state.return_data gets this 192-byte data.
+        // The perp call will read the same data; first 32 bytes = totalCollateralBase.
+        // Set totalCollateralBase to perp_hf so the perp decode sees the right value.
+        let lending_calldata = getUserAccountDataCall { user: account }.abi_encode();
+        type AaveReturn = (
+            sol_data::Uint<256>,
+            sol_data::Uint<256>,
+            sol_data::Uint<256>,
+            sol_data::Uint<256>,
+            sol_data::Uint<256>,
+            sol_data::Uint<256>,
+        );
+        let lending_return_data = <AaveReturn as SolType>::abi_encode_params(&(
+            perp_hf, // totalCollateralBase = perp_hf (what perp decode sees)
+            U256::from(500_000),
+            U256::from(200_000),
+            U256::from(8000),
+            U256::from(7500),
+            lending_hf,
+        ));
+        vm.mock_static_call(pool, lending_calldata, Ok(lending_return_data));
+    }
+
     // ─── Initialize ─────────────────────────────────────────────────────
 
     #[test]
@@ -455,6 +642,152 @@ mod tests {
         let acct = address!("0000000000000000000000000000000000000099");
         let err = contract.add_account(acct).unwrap_err();
         assert_eq!(err, b"not owner".to_vec());
+    }
+
+    // ─── Two-step ownership transfer (LM-4) ────────────────────────────
+
+    #[test]
+    fn test_transfer_ownership_propose_accept() {
+        let (vm, mut contract) = setup();
+        vm.set_sender(OWNER);
+        contract.transfer_ownership(NEW_OWNER).unwrap();
+
+        let logs = vm.get_emitted_logs();
+        let selector = OwnershipTransferStarted::SIGNATURE_HASH;
+        let start_logs: Vec<_> = logs
+            .iter()
+            .filter(|(topics, _)| !topics.is_empty() && topics[0] == selector)
+            .collect();
+        assert_eq!(start_logs.len(), 1);
+        assert_eq!(start_logs[0].0[1], B256::from(OWNER.into_word()));
+        assert_eq!(start_logs[0].0[2], B256::from(NEW_OWNER.into_word()));
+
+        vm.set_sender(NEW_OWNER);
+        contract.accept_ownership().unwrap();
+
+        let logs = vm.get_emitted_logs();
+        let selector = OwnershipTransferred::SIGNATURE_HASH;
+        let transfer_logs: Vec<_> = logs
+            .iter()
+            .filter(|(topics, _)| !topics.is_empty() && topics[0] == selector)
+            .collect();
+        assert_eq!(transfer_logs.len(), 1);
+        assert_eq!(transfer_logs[0].0[1], B256::from(OWNER.into_word()));
+        assert_eq!(transfer_logs[0].0[2], B256::from(NEW_OWNER.into_word()));
+
+        vm.set_sender(NEW_OWNER);
+        let acct = address!("0000000000000000000000000000000000000099");
+        assert!(contract.add_account(acct).is_ok());
+
+        vm.set_sender(OWNER);
+        let acct2 = address!("0000000000000000000000000000000000000098");
+        let err = contract.add_account(acct2).unwrap_err();
+        assert_eq!(err, b"not owner".to_vec());
+    }
+
+    #[test]
+    fn test_transfer_ownership_wrong_acceptor() {
+        let (vm, mut contract) = setup();
+        vm.set_sender(OWNER);
+        contract.transfer_ownership(NEW_OWNER).unwrap();
+
+        vm.set_sender(STRANGER);
+        let err = contract.accept_ownership().unwrap_err();
+        assert_eq!(err, b"not pending owner".to_vec());
+    }
+
+    #[test]
+    fn test_transfer_ownership_non_owner_rejected() {
+        let (vm, mut contract) = setup();
+        vm.set_sender(STRANGER);
+        let err = contract.transfer_ownership(NEW_OWNER).unwrap_err();
+        assert_eq!(err, b"not owner".to_vec());
+    }
+
+    #[test]
+    fn test_transfer_ownership_zero_address_rejected() {
+        let (vm, mut contract) = setup();
+        vm.set_sender(OWNER);
+        let err = contract.transfer_ownership(Address::ZERO).unwrap_err();
+        assert_eq!(err, b"zero address".to_vec());
+    }
+
+    // ─── Pausable (CC-2) ────────────────────────────────────────────────
+
+    #[test]
+    fn test_pause_blocks_add_account() {
+        let (vm, mut contract) = setup();
+        vm.set_sender(OWNER);
+        contract.pause().unwrap();
+        assert!(contract.is_paused());
+
+        let acct = address!("0000000000000000000000000000000000000099");
+        let err = contract.add_account(acct).unwrap_err();
+        assert_eq!(err, b"contract is paused".to_vec());
+    }
+
+    #[test]
+    fn test_unpause_allows_add_account() {
+        let (vm, mut contract) = setup();
+        vm.set_sender(OWNER);
+        contract.pause().unwrap();
+        contract.unpause().unwrap();
+        assert!(!contract.is_paused());
+
+        let acct = address!("0000000000000000000000000000000000000099");
+        assert!(contract.add_account(acct).is_ok());
+    }
+
+    #[test]
+    fn test_pause_non_owner_rejected() {
+        let (vm, mut contract) = setup();
+        vm.set_sender(STRANGER);
+        let err = contract.pause().unwrap_err();
+        assert_eq!(err, b"not owner".to_vec());
+    }
+
+    #[test]
+    fn test_pause_blocks_scan_accounts() {
+        let vm = TestVM::new();
+        vm.set_sender(OWNER);
+        let mut contract = LiquidationMonitor::from(&vm);
+        contract.initialize(default_threshold()).unwrap();
+        contract.add_lending_protocol(POOL, 0).unwrap();
+        contract.pause().unwrap();
+
+        let a1 = address!("0000000000000000000000000000000000000021");
+        let err = contract.scan_accounts(vec![a1]).unwrap_err();
+        assert_eq!(err, b"contract is paused".to_vec());
+    }
+
+    #[test]
+    fn test_pause_blocks_scan_tracked_accounts() {
+        let vm = TestVM::new();
+        vm.set_sender(OWNER);
+        let mut contract = LiquidationMonitor::from(&vm);
+        contract.initialize(default_threshold()).unwrap();
+        contract.add_lending_protocol(POOL, 0).unwrap();
+        contract.pause().unwrap();
+
+        let err = contract.scan_tracked_accounts().unwrap_err();
+        assert_eq!(err, b"contract is paused".to_vec());
+    }
+
+    #[test]
+    fn test_pause_already_paused() {
+        let (vm, mut contract) = setup();
+        vm.set_sender(OWNER);
+        contract.pause().unwrap();
+        let err = contract.pause().unwrap_err();
+        assert_eq!(err, b"already paused".to_vec());
+    }
+
+    #[test]
+    fn test_unpause_not_paused() {
+        let (vm, mut contract) = setup();
+        vm.set_sender(OWNER);
+        let err = contract.unpause().unwrap_err();
+        assert_eq!(err, b"not paused".to_vec());
     }
 
     // ─── Account management ─────────────────────────────────────────────
@@ -598,10 +931,12 @@ mod tests {
         let (vm, contract) = setup();
         let a1 = address!("0000000000000000000000000000000000000021");
         mock_health_factor(&vm, a1, U256::from(900_000_000_000_000_000u128));
-        let at_risk = contract.scan_accounts(vec![a1]).unwrap();
+
+        let (at_risk, failed) = contract.scan_accounts(vec![a1]).unwrap();
         assert_eq!(at_risk.len(), 1);
         assert_eq!(at_risk[0].0, a1);
         assert_eq!(at_risk[0].1, U256::from(900_000_000_000_000_000u128));
+        assert!(failed.is_empty());
     }
 
     #[test]
@@ -609,8 +944,9 @@ mod tests {
         let (vm, contract) = setup();
         let a2 = address!("0000000000000000000000000000000000000022");
         mock_health_factor(&vm, a2, U256::from(2_000_000_000_000_000_000u128));
-        let at_risk = contract.scan_accounts(vec![a2]).unwrap();
+        let (at_risk, failed) = contract.scan_accounts(vec![a2]).unwrap();
         assert!(at_risk.is_empty());
+        assert!(failed.is_empty());
     }
 
     #[test]
@@ -618,7 +954,7 @@ mod tests {
         let (vm, contract) = setup();
         let a3 = address!("0000000000000000000000000000000000000023");
         mock_health_factor(&vm, a3, U256::from(1_000_000_000_000_000_000u128));
-        let at_risk = contract.scan_accounts(vec![a3]).unwrap();
+        let (at_risk, _) = contract.scan_accounts(vec![a3]).unwrap();
         assert_eq!(at_risk.len(), 1);
         assert_eq!(at_risk[0].0, a3);
     }
@@ -626,8 +962,9 @@ mod tests {
     #[test]
     fn scan_accounts_empty_input_returns_empty() {
         let (_, contract) = setup();
-        let result = contract.scan_accounts(vec![]).unwrap();
-        assert!(result.is_empty());
+        let (at_risk, failed) = contract.scan_accounts(vec![]).unwrap();
+        assert!(at_risk.is_empty());
+        assert!(failed.is_empty());
     }
 
     #[test]
@@ -637,8 +974,9 @@ mod tests {
         let a2 = address!("0000000000000000000000000000000000000032");
         mock_health_factor(&vm, a1, U256::from(3_000_000_000_000_000_000u128));
         mock_health_factor(&vm, a2, U256::from(5_000_000_000_000_000_000u128));
-        let result = contract.scan_accounts(vec![a1, a2]).unwrap();
-        assert!(result.is_empty());
+        let (at_risk, failed) = contract.scan_accounts(vec![a1, a2]).unwrap();
+        assert!(at_risk.is_empty());
+        assert!(failed.is_empty());
     }
 
     #[test]
@@ -655,9 +993,10 @@ mod tests {
         let timestamp = 1_700_000_000u64;
         vm.set_block_timestamp(timestamp);
 
-        let at_risk = contract.scan_tracked_accounts().unwrap();
+        let (at_risk, failed) = contract.scan_tracked_accounts().unwrap();
         assert_eq!(at_risk.len(), 1);
         assert_eq!(at_risk[0], (a1, hf_low));
+        assert!(failed.is_empty());
 
         let logs = vm.get_emitted_logs();
         let at_risk_selector = AccountAtRisk::SIGNATURE_HASH;
@@ -685,8 +1024,121 @@ mod tests {
         let hf_high = U256::from(2_000_000_000_000_000_000u128);
         mock_health_factor(&vm, a2, hf_high);
 
-        let at_risk = contract.scan_tracked_accounts().unwrap();
+        let (at_risk, _) = contract.scan_tracked_accounts().unwrap();
         assert!(at_risk.is_empty());
+    }
+
+    // ─── Scan accounts with failed queries (LM-2) ──────────────────────
+
+    #[test]
+    fn test_scan_accounts_returns_failed_accounts() {
+        let vm = TestVM::new();
+        vm.set_sender(OWNER);
+        let mut contract = LiquidationMonitor::from(&vm);
+        contract.initialize(default_threshold()).unwrap();
+        contract.add_lending_protocol(POOL_FAIL, 0).unwrap();
+
+        let a_fail = address!("0000000000000000000000000000000000000061");
+        mock_pool_error(&vm, POOL_FAIL, a_fail);
+
+        let (at_risk, failed) = contract.scan_accounts(vec![a_fail]).unwrap();
+        assert!(at_risk.is_empty());
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0], a_fail);
+    }
+
+    #[test]
+    fn test_scan_tracked_returns_failed_accounts() {
+        let vm = TestVM::new();
+        vm.set_sender(OWNER);
+        let mut contract = LiquidationMonitor::from(&vm);
+        contract.initialize(default_threshold()).unwrap();
+        // Use POOL for successful account, POOL_FAIL for failing account
+        // Register POOL_FAIL only — accounts on this pool will fail
+        contract.add_lending_protocol(POOL_FAIL, 0).unwrap();
+
+        let a_fail = address!("0000000000000000000000000000000000000063");
+        contract.add_account(a_fail).unwrap();
+
+        // Mock error for a_fail — this is the LAST mock so state.return_data is error data
+        mock_pool_error(&vm, POOL_FAIL, a_fail);
+
+        let timestamp = 1_700_000_000u64;
+        vm.set_block_timestamp(timestamp);
+
+        let (at_risk, failed) = contract.scan_tracked_accounts().unwrap();
+        assert!(at_risk.is_empty());
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0], a_fail);
+
+        // Verify no at-risk events were emitted (only setup events exist)
+        let logs = vm.get_emitted_logs();
+        let at_risk_selector = AccountAtRisk::SIGNATURE_HASH;
+        let risk_logs: Vec<_> = logs
+            .iter()
+            .filter(|(topics, _)| !topics.is_empty() && topics[0] == at_risk_selector)
+            .collect();
+        assert_eq!(risk_logs.len(), 0);
+    }
+
+    // ─── Perp protocol dispatch (LM-6) ─────────────────────────────────
+
+    #[test]
+    fn test_get_health_factor_includes_perp_protocols() {
+        let vm = TestVM::new();
+        vm.set_sender(OWNER);
+        let mut contract = LiquidationMonitor::from(&vm);
+        contract.initialize(default_threshold()).unwrap();
+        contract.add_perp_protocol(GMX_READER, 0).unwrap();
+
+        let account = address!("0000000000000000000000000000000000000070");
+        let expected_hf = U256::from(1_050_000_000_000_000_000u128);
+        mock_perp_health_factor(&vm, GMX_READER, account, expected_hf);
+
+        let hf = contract.get_health_factor(account).unwrap();
+        assert_eq!(hf, expected_hf);
+    }
+
+    #[test]
+    fn test_get_health_factor_perp_lower_than_lending() {
+        // Due to stylus-test's shared return_data behavior, both calls read
+        // from the same buffer. We register the lending mock LAST so its
+        // 192-byte data is in state.return_data (needed by the first call).
+        // The perp call (second) reads the same 192 bytes — first 32 bytes
+        // = totalCollateralBase. We set that to the perp HF value.
+        let vm = TestVM::new();
+        vm.set_sender(OWNER);
+        let mut contract = LiquidationMonitor::from(&vm);
+        contract.initialize(default_threshold()).unwrap();
+        contract.add_lending_protocol(POOL, 0).unwrap();
+        contract.add_perp_protocol(GMX_READER, 0).unwrap();
+
+        let account = address!("0000000000000000000000000000000000000071");
+        let lending_hf = U256::from(2_000_000_000_000_000_000u128);
+        let perp_hf = U256::from(800_000_000_000_000_000u128);
+
+        mock_lending_and_perp(&vm, POOL, GMX_READER, account, lending_hf, perp_hf);
+
+        let hf = contract.get_health_factor(account).unwrap();
+        // The perp reads totalCollateralBase (= perp_hf = 0.8e18) as its HF
+        // The lending reads healthFactor (= lending_hf = 2.0e18)
+        // Lowest is perp_hf
+        assert_eq!(hf, perp_hf);
+    }
+
+    #[test]
+    fn test_get_health_factor_skips_inactive_perp() {
+        let (vm, mut contract) = setup();
+        vm.set_sender(OWNER);
+        contract.add_perp_protocol(GMX_READER, 0).unwrap();
+        contract.remove_perp_protocol(U256::ZERO).unwrap();
+
+        let account = address!("0000000000000000000000000000000000000072");
+        let lending_hf = U256::from(1_500_000_000_000_000_000u128);
+        mock_health_factor(&vm, account, lending_hf);
+
+        let hf = contract.get_health_factor(account).unwrap();
+        assert_eq!(hf, lending_hf);
     }
 
     // ─── Lending protocol registry ──────────────────────────────────────
@@ -828,7 +1280,7 @@ mod tests {
 
         let account = address!("0000000000000000000000000000000000000020");
         let err = contract.get_health_factor(account).unwrap_err();
-        assert_eq!(err, b"no lending protocols registered".to_vec());
+        assert_eq!(err, b"no protocols registered".to_vec());
     }
 
     #[test]
@@ -839,7 +1291,7 @@ mod tests {
 
         let account = address!("0000000000000000000000000000000000000020");
         let err = contract.get_health_factor(account).unwrap_err();
-        assert_eq!(err, b"no lending protocols registered".to_vec());
+        assert_eq!(err, b"no protocols registered".to_vec());
     }
 
     #[test]
@@ -943,5 +1395,64 @@ mod tests {
         assert_eq!(addr, POOL_2);
         assert_eq!(ptype, U256::ZERO);
         assert!(active);
+    }
+
+    // ─── Gap tests: mixed results & edge cases ─────────────────────────
+
+    #[test]
+    fn scan_mixed_success_and_failure() {
+        // Use separate contracts to avoid mock_static_call ordering issues.
+        // Test 1: account at risk (low HF on working pool)
+        let vm1 = TestVM::new();
+        vm1.set_sender(OWNER);
+        let mut c1 = LiquidationMonitor::from(&vm1);
+        c1.initialize(default_threshold()).unwrap();
+        c1.add_lending_protocol(POOL, 0).unwrap();
+
+        let risky_acct = address!("0000000000000000000000000000000000000aaa");
+        let low_hf = U256::from(900_000_000_000_000_000u128); // 0.9e18
+        mock_health_factor(&vm1, risky_acct, low_hf);
+
+        let (at_risk, failed) = c1.scan_accounts(vec![risky_acct]).unwrap();
+        assert_eq!(at_risk.len(), 1);
+        assert_eq!(at_risk[0].0, risky_acct);
+        assert_eq!(at_risk[0].1, low_hf);
+        assert!(failed.is_empty());
+
+        // Test 2: failing account (pool errors)
+        let vm2 = TestVM::new();
+        vm2.set_sender(OWNER);
+        let mut c2 = LiquidationMonitor::from(&vm2);
+        c2.initialize(default_threshold()).unwrap();
+        c2.add_lending_protocol(POOL_FAIL, 0).unwrap();
+
+        let fail_acct = address!("0000000000000000000000000000000000000bbb");
+        mock_pool_error(&vm2, POOL_FAIL, fail_acct);
+
+        let (at_risk, failed) = c2.scan_accounts(vec![fail_acct]).unwrap();
+        assert!(at_risk.is_empty());
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0], fail_acct);
+    }
+
+    #[test]
+    fn scan_zero_threshold_flags_all() {
+        let vm = TestVM::new();
+        vm.set_sender(OWNER);
+        let mut contract = LiquidationMonitor::from(&vm);
+        // Initialize with threshold = 0
+        contract.initialize(U256::ZERO).unwrap();
+        contract.add_lending_protocol(POOL, 0).unwrap();
+
+        let acct = address!("0000000000000000000000000000000000000ccc");
+        // Even a very low HF is NOT < 0, so nobody should be flagged
+        let low_hf = U256::from(1u64);
+        mock_health_factor(&vm, acct, low_hf);
+
+        let accounts = vec![acct];
+        let (at_risk, failed) = contract.scan_accounts(accounts).unwrap();
+        // HF=1 is not < 0, so not at risk
+        assert!(at_risk.is_empty());
+        assert!(failed.is_empty());
     }
 }

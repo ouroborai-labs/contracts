@@ -8,6 +8,7 @@
 
 #![cfg_attr(not(any(feature = "export-abi", test)), no_main)]
 #![cfg_attr(not(any(feature = "export-abi", test)), no_std)]
+#![allow(unexpected_cfgs, non_snake_case, clippy::too_many_arguments)]
 
 extern crate alloc;
 
@@ -52,6 +53,10 @@ sol_interface! {
 sol! {
     event DexAdded(uint256 indexed index, address dexAddress, uint64 dexType);
     event DexRemoved(uint256 indexed index, address dexAddress);
+    event OwnershipTransferStarted(address indexed currentOwner, address indexed pendingOwner);
+    event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
+    event Paused(address indexed by);
+    event Unpaused(address indexed by);
 }
 
 // ─── Contract storage ───────────────────────────────────────────────────────
@@ -60,6 +65,9 @@ sol_storage! {
     #[entrypoint]
     pub struct RouteOptimizer {
         address owner;
+        address pending_owner;
+        bool paused;
+        bool locked;
         uint256 dex_count;
         mapping(uint256 => address) dex_addresses;
         mapping(uint256 => uint256) dex_types;
@@ -186,6 +194,62 @@ impl RouteOptimizer {
         U256::from(self.routing_tokens.len())
     }
 
+    // ─── Ownership transfer (RO-4 / CC-1) ──────────────────────────────
+
+    pub fn transfer_ownership(&mut self, new_owner: Address) -> Result<(), Vec<u8>> {
+        self.only_owner()?;
+        if new_owner == Address::ZERO {
+            return Err(b"zero address".to_vec());
+        }
+        self.pending_owner.set(new_owner);
+        self.vm().log(OwnershipTransferStarted {
+            currentOwner: self.owner.get(),
+            pendingOwner: new_owner,
+        });
+        Ok(())
+    }
+
+    pub fn accept_ownership(&mut self) -> Result<(), Vec<u8>> {
+        let sender = self.vm().msg_sender();
+        if sender != self.pending_owner.get() {
+            return Err(b"not pending owner".to_vec());
+        }
+        let previous = self.owner.get();
+        self.owner.set(sender);
+        self.pending_owner.set(Address::ZERO);
+        self.vm().log(OwnershipTransferred {
+            previousOwner: previous,
+            newOwner: sender,
+        });
+        Ok(())
+    }
+
+    // ─── Pausable (CC-2) ────────────────────────────────────────────────
+
+    pub fn pause(&mut self) -> Result<(), Vec<u8>> {
+        self.only_owner()?;
+        if self.paused.get() {
+            return Err(b"already paused".to_vec());
+        }
+        self.paused.set(true);
+        self.vm().log(Paused {
+            by: self.vm().msg_sender(),
+        });
+        Ok(())
+    }
+
+    pub fn unpause(&mut self) -> Result<(), Vec<u8>> {
+        self.only_owner()?;
+        if !self.paused.get() {
+            return Err(b"not paused".to_vec());
+        }
+        self.paused.set(false);
+        self.vm().log(Unpaused {
+            by: self.vm().msg_sender(),
+        });
+        Ok(())
+    }
+
     // ─── Route finding ──────────────────────────────────────────────────
 
     pub fn find_best_route(
@@ -194,11 +258,18 @@ impl RouteOptimizer {
         token_out: Address,
         amount_in: U256,
     ) -> Result<(U256, Vec<Address>, Vec<u32>), Vec<u8>> {
+        self.when_not_paused()?;
+        if self.locked.get() {
+            return Err(b"reentrancy".to_vec());
+        }
+        self.locked.set(true);
+
         let mut best_out = U256::ZERO;
         let mut best_tokens: Vec<Address> = Vec::new();
         let mut best_fees: Vec<u32> = Vec::new();
         let count = self.dex_count.get();
 
+        // Safe: MAX_DEXES=20 bounds count well within u64, so as_limbs()[0] cannot truncate.
         for idx in 0..count.as_limbs()[0] {
             let index = U256::from(idx);
             if !self.dex_active.get(index) {
@@ -235,6 +306,8 @@ impl RouteOptimizer {
             }
         }
 
+        self.locked.set(false);
+
         if best_out == U256::ZERO {
             return Err(b"no route found".to_vec());
         }
@@ -248,10 +321,17 @@ impl RouteOptimizer {
         token_out: Address,
         amount_in: U256,
     ) -> Result<(U256, U256), Vec<u8>> {
+        self.when_not_paused()?;
+        if self.locked.get() {
+            return Err(b"reentrancy".to_vec());
+        }
+        self.locked.set(true);
+
         let mut best_index = U256::ZERO;
         let mut best_out = U256::ZERO;
         let count = self.dex_count.get();
 
+        // Safe: MAX_DEXES=20 bounds count well within u64, so as_limbs()[0] cannot truncate.
         for idx in 0..count.as_limbs()[0] {
             let index = U256::from(idx);
             if !self.dex_active.get(index) {
@@ -273,6 +353,12 @@ impl RouteOptimizer {
             }
         }
 
+        self.locked.set(false);
+
+        if best_out == U256::ZERO {
+            return Err(b"no route found".to_vec());
+        }
+
         Ok((best_index, best_out))
     }
 }
@@ -280,6 +366,7 @@ impl RouteOptimizer {
 // ─── Private helpers (not ABI-exported) ─────────────────────────────────────
 
 impl RouteOptimizer {
+    #[allow(clippy::too_many_arguments)]
     fn quote_univ3(
         &mut self,
         quoter_addr: Address,
@@ -344,6 +431,7 @@ impl RouteOptimizer {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn quote_amm_v2(
         &mut self,
         router_addr: Address,
@@ -451,6 +539,13 @@ impl RouteOptimizer {
         }
         Ok(())
     }
+
+    fn when_not_paused(&self) -> Result<(), Vec<u8>> {
+        if self.paused.get() {
+            return Err(b"paused".to_vec());
+        }
+        Ok(())
+    }
 }
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
@@ -478,12 +573,13 @@ fn encode_path_two_hop(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloy_primitives::{address, Address, B256, U256};
+    use alloy_primitives::{address, Address, U256};
     use alloy_sol_types::{SolCall, SolEvent, SolType, sol, sol_data};
     use stylus_test::TestVM;
 
     const OWNER: Address = address!("0000000000000000000000000000000000000001");
     const STRANGER: Address = address!("0000000000000000000000000000000000000bad");
+    const NEW_OWNER: Address = address!("0000000000000000000000000000000000000002");
     const WETH: Address = address!("82aF49447D8a07e3bd95BD0d56f35241523fBab1");
     const USDC: Address = address!("af88d065e77c8cC2239327C5EDb3A432268e5831");
     const ARB: Address = address!("912CE59144191C1204E64559FE8253a0e49E6548");
@@ -1291,16 +1387,16 @@ mod tests {
     }
 
     #[test]
-    fn compare_routes_no_dex_returns_zero() {
+    fn compare_routes_no_route_returns_error() {
         let vm = TestVM::new();
         vm.set_sender(OWNER);
         let mut contract = RouteOptimizer::from(&vm);
         contract.initialize().unwrap();
 
-        let (dex_index, best_amount) =
-            contract.compare_routes(ARB, DAI, U256::from(1000u64)).unwrap();
-        assert_eq!(dex_index, U256::ZERO);
-        assert_eq!(best_amount, U256::ZERO);
+        let err = contract
+            .compare_routes(ARB, DAI, U256::from(1000u64))
+            .unwrap_err();
+        assert_eq!(err, b"no route found".to_vec());
     }
 
     #[test]
@@ -1321,5 +1417,101 @@ mod tests {
         let overflow_addr: Address = "0000000000000000000000000000000000009999".parse().unwrap();
         let err = contract.add_dex(overflow_addr, DEX_TYPE_UNIV3).unwrap_err();
         assert_eq!(err, b"max dexes reached".to_vec());
+    }
+
+    // ─── Reentrancy guard tests (RO-1) ──────────────────────────────────
+
+    #[test]
+    fn test_reentrancy_guard_on_find_best_route() {
+        let (vm, mut contract) = setup_contract();
+        vm.set_sender(OWNER);
+        contract.locked.set(true);
+
+        let err = contract
+            .find_best_route(ARB, DAI, U256::from(1000u64))
+            .unwrap_err();
+        assert_eq!(err, b"reentrancy".to_vec());
+    }
+
+    #[test]
+    fn test_reentrancy_guard_on_compare_routes() {
+        let (vm, mut contract) = setup_contract();
+        vm.set_sender(OWNER);
+        contract.locked.set(true);
+
+        let err = contract
+            .compare_routes(ARB, DAI, U256::from(1000u64))
+            .unwrap_err();
+        assert_eq!(err, b"reentrancy".to_vec());
+    }
+
+    // ─── Ownership transfer tests (RO-4 / CC-1) ────────────────────────
+
+    #[test]
+    fn test_transfer_ownership_propose_accept() {
+        let (vm, mut contract) = setup_contract();
+        vm.set_sender(OWNER);
+        contract.transfer_ownership(NEW_OWNER).unwrap();
+
+        vm.set_sender(NEW_OWNER);
+        contract.accept_ownership().unwrap();
+
+        assert_eq!(contract.owner.get(), NEW_OWNER);
+        assert_eq!(contract.pending_owner.get(), Address::ZERO);
+    }
+
+    #[test]
+    fn test_transfer_ownership_wrong_acceptor() {
+        let (vm, mut contract) = setup_contract();
+        vm.set_sender(OWNER);
+        contract.transfer_ownership(NEW_OWNER).unwrap();
+
+        vm.set_sender(STRANGER);
+        let err = contract.accept_ownership().unwrap_err();
+        assert_eq!(err, b"not pending owner".to_vec());
+    }
+
+    #[test]
+    fn test_transfer_ownership_non_owner_rejected() {
+        let (vm, mut contract) = setup_contract();
+        vm.set_sender(STRANGER);
+        let err = contract.transfer_ownership(NEW_OWNER).unwrap_err();
+        assert_eq!(err, b"not owner".to_vec());
+    }
+
+    // ─── Pausable tests (CC-2) ──────────────────────────────────────────
+
+    #[test]
+    fn test_pause_blocks_find_best_route() {
+        let (vm, mut contract) = setup_contract();
+        vm.set_sender(OWNER);
+        contract.pause().unwrap();
+
+        let err = contract
+            .find_best_route(ARB, DAI, U256::from(1000u64))
+            .unwrap_err();
+        assert_eq!(err, b"paused".to_vec());
+    }
+
+    #[test]
+    fn test_unpause_allows_routing() {
+        let (vm, mut contract) = setup_contract();
+        vm.set_sender(OWNER);
+        contract.pause().unwrap();
+        contract.unpause().unwrap();
+
+        // After unpause, should work (will fail with "no route found" since no mocks, but NOT "paused")
+        let err = contract
+            .find_best_route(ARB, DAI, U256::from(1000u64))
+            .unwrap_err();
+        assert_eq!(err, b"no route found".to_vec());
+    }
+
+    #[test]
+    fn test_pause_non_owner_rejected() {
+        let (vm, mut contract) = setup_contract();
+        vm.set_sender(STRANGER);
+        let err = contract.pause().unwrap_err();
+        assert_eq!(err, b"not owner".to_vec());
     }
 }
