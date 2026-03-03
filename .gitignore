@@ -8,6 +8,11 @@ target/
 .env.*.local
 .env.keys
 *.env.keys
+.mcp.json
+config.json
+
+# Dependencies
+node_modules/
 
 # Claude Code
 .claude/
