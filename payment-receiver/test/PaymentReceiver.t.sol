@@ -3,10 +3,12 @@ pragma solidity ^0.8.24;
 
 import "forge-std/Test.sol";
 import {PaymentReceiver} from "../src/PaymentReceiver.sol";
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
-/// @dev Minimal ERC20 mock for testing
+/// @dev Minimal ERC20 mock with full IERC20 interface for SafeERC20 compatibility
 contract MockUSDC {
     mapping(address => uint256) public balanceOf;
+    mapping(address => mapping(address => uint256)) public allowance;
 
     function mint(address to, uint256 amount) external {
         balanceOf[to] += amount;
@@ -17,6 +19,24 @@ contract MockUSDC {
         balanceOf[msg.sender] -= amount;
         balanceOf[to] += amount;
         return true;
+    }
+
+    function transferFrom(address from, address to, uint256 amount) external returns (bool) {
+        require(balanceOf[from] >= amount, "insufficient");
+        require(allowance[from][msg.sender] >= amount, "allowance");
+        allowance[from][msg.sender] -= amount;
+        balanceOf[from] -= amount;
+        balanceOf[to] += amount;
+        return true;
+    }
+
+    function approve(address spender, uint256 amount) external returns (bool) {
+        allowance[msg.sender][spender] = amount;
+        return true;
+    }
+
+    function totalSupply() external pure returns (uint256) {
+        return 0;
     }
 }
 
@@ -33,7 +53,17 @@ contract PaymentReceiverTest is Test {
 
     function test_constructor() public view {
         assertEq(receiver.treasury(), treasury);
-        assertEq(receiver.usdc(), address(usdc));
+        assertEq(address(receiver.usdc()), address(usdc));
+    }
+
+    function test_constructor_reverts_zero_treasury() public {
+        vm.expectRevert(PaymentReceiver.ZeroAddress.selector);
+        new PaymentReceiver(address(0), address(usdc));
+    }
+
+    function test_constructor_reverts_zero_usdc() public {
+        vm.expectRevert(PaymentReceiver.ZeroAddress.selector);
+        new PaymentReceiver(treasury, address(0));
     }
 
     function test_balance_zero() public view {
